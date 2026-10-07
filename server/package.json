@@ -1,0 +1,23 @@
+{
+  "name": "secure-chat-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Ciphertext-only relay server for the two-person secure chat",
+  "scripts": {
+    "build": "tsc",
+    "prestart": "npm run build",
+    "start": "node dist/server.js",
+    "pretest": "npm run build",
+    "test": "node --test tests/"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.17.10",
+    "socket.io-client": "^4.8.1",
+    "typescript": "^5.7.2"
+  }
+}

@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Secure Chat</title>
+  <link rel="stylesheet" href="/src/styles.css" />
+</head>
+<body>
+  <div id="join-screen" class="screen active">
+    <div class="card">
+      <div class="logo">🔐</div>
+      <h1>Secure Chat</h1>
+      <p class="subtitle">Choose your identity</p>
+      <div class="identity-buttons">
+        <button type="button" data-role="A">Person A</button>
+        <button type="button" data-role="B">Person B</button>
+      </div>
+      <p id="join-error" class="error" role="alert"></p>
+      <p class="hint">Keys are generated on this device and never leave it.</p>
+    </div>
+  </div>
+
+  <div id="chat-screen" class="screen">
+    <header class="chat-header">
+      <div class="header-top">
+        <span class="title">🔐 Secure Chat</span>
+        <span id="identity" class="identity">Person A</span>
+      </div>
+      <div id="encryption-status" class="status status-wait">🔒 Exchanging keys…</div>
+      <div id="connection-status" class="status status-wait">Connecting…</div>
+      <div class="fingerprints">
+        <span id="own-fingerprint" class="fingerprint">Your fingerprint: …</span>
+        <span id="peer-fingerprint" class="fingerprint hidden">Peer fingerprint: …</span>
+      </div>
+    </header>
+
+    <main id="messages" class="messages" aria-live="polite"></main>
+
+    <div id="notice" class="notice hidden" role="status"></div>
+
+    <form id="composer" class="composer" autocomplete="off">
+      <input
+        id="message-input"
+        type="text"
+        maxlength="4096"
+        placeholder="Type a message…"
+        aria-label="Message"
+      />
+      <button type="submit" aria-label="Send">➤</button>
+    </form>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script type="module" src="/src/app.js"></script>
+</body>
+</html>

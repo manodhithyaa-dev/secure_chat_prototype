@@ -1,0 +1,10 @@
+{
+  "name": "secure-chat-client",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser client for the two-person secure chat",
+  "scripts": {
+    "test": "node --test tests/"
+  }
+}

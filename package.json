@@ -1,0 +1,12 @@
+{
+  "name": "secure-chat",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Two-person end-to-end encrypted chat prototype",
+  "scripts": {
+    "setup": "npm --prefix server install && npm --prefix client install",
+    "build": "npm --prefix server run build",
+    "server": "npm --prefix server start",
+    "test": "npm --prefix client test && npm --prefix server test"
+  }
+}
