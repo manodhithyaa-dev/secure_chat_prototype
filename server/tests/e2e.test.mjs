@@ -1,290 +1,151 @@
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { io as ioClient } from 'socket.io-client';
 import {
-  decryptMessage,
-  deriveSharedKey,
-  encryptMessage,
-  exportPublicKey,
-  generateKeyPair
-} from '../../client/src/crypto.js';
+  TestSocket,
+  apiPost,
+  connectUser,
+  createKeyPair,
+  deriveConversationKey,
+  encryptFor,
+  registerUser,
+  startServer
+} from './helpers/harness.mjs';
+import { startTestDb, stopTestDb } from './helpers/testdb.mjs';
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-const serverRoot = path.join(here, '..');
-const port = 4000 + Math.floor(Math.random() * 2000);
-const url = `http://localhost:${port}`;
+const ALLOWED_CLIENT_EVENTS = new Set(['conversation_create', 'message_send', 'message_ack', 'message_sync']);
 
-const TRACKED_EVENTS = [
-  'joined',
-  'join_error',
-  'peer_public_key',
-  'encrypted_message',
-  'delivery_status',
-  'message_rejected',
-  'peer_status'
-];
+let db;
+let server;
+let alice;
+let bob;
+let conversation;
+const sockets = [];
 
-const ALLOWED_CLIENT_EVENTS = new Set(['join', 'public_key', 'encrypted_message', 'delivery_status']);
-
-const sentLog = [];
-
-class TestClient {
-  constructor(label) {
-    this.label = label;
-    this.log = [];
-    this.pending = [];
-    this.waiters = [];
-    this.socket = ioClient(url, { transports: ['websocket'], reconnection: false });
-    for (const event of TRACKED_EVENTS) {
-      this.socket.on(event, (payload) => this._receive(event, payload));
-    }
+async function user(name) {
+  const keys = await createKeyPair();
+  const r = await registerUser(server.url, {
+    username: name,
+    email: `${name}@test.local`,
+    password: 'password123',
+    publicKey: keys.publicKeyBase64,
+    displayName: name
+  });
+  if (r.status !== 201) {
+    throw new Error(`register ${name} failed: ${r.status} ${JSON.stringify(r.body)}`);
   }
-
-  _receive(event, payload) {
-    const entry = { event, payload };
-    this.log.push(entry);
-    const waiter = this.waiters.find((w) => w.event === event && w.match(payload));
-    if (waiter) {
-      this.waiters = this.waiters.filter((w) => w !== waiter);
-      clearTimeout(waiter.timer);
-      waiter.resolve(payload);
-      return;
-    }
-    this.pending.push(entry);
-  }
-
-  next(event, match = () => true, timeout = 5000) {
-    const index = this.pending.findIndex((entry) => entry.event === event && match(entry.payload));
-    if (index >= 0) {
-      const [entry] = this.pending.splice(index, 1);
-      return Promise.resolve(entry.payload);
-    }
-    return new Promise((resolve, reject) => {
-      const waiter = { event, match, resolve, payload: null };
-      waiter.timer = setTimeout(() => {
-        this.waiters = this.waiters.filter((w) => w !== waiter);
-        reject(new Error(`${this.label}: timed out waiting for "${event}"`));
-      }, timeout);
-      this.waiters.push(waiter);
-    });
-  }
-
-  emit(event, payload) {
-    sentLog.push({ from: this.label, event, payload });
-    this.socket.emit(event, payload);
-  }
-
-  disconnect() {
-    this.socket.disconnect();
-  }
+  return { keys, user: r.body.user, cookie: r.cookie };
 }
 
-async function createPair() {
-  const pair = await generateKeyPair();
-  return { ...pair, publicKeyBase64: await exportPublicKey(pair.publicKey) };
+async function track(name, cookie) {
+  const s = await connectUser(server.url, cookie, name);
+  sockets.push(s);
+  return s;
 }
 
-let serverProcess;
-let serverOutput = '';
-
-function startServer() {
-  const child = spawn(process.execPath, ['dist/server.js'], {
-    cwd: serverRoot,
-    env: { ...process.env, PORT: String(port) },
-    stdio: ['ignore', 'pipe', 'pipe']
-  });
-  child.stdout.on('data', (chunk) => {
-    serverOutput += chunk.toString();
-  });
-  child.stderr.on('data', (chunk) => {
-    serverOutput += chunk.toString();
-  });
-  const ready = new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`Server did not start: ${serverOutput}`)), 10000);
-    const check = setInterval(() => {
-      if (serverOutput.includes('listening')) {
-        clearInterval(check);
-        clearTimeout(timer);
-        resolve();
-      }
-    }, 50);
-    child.on('exit', (code) => {
-      clearInterval(check);
-      clearTimeout(timer);
-      reject(new Error(`Server exited early with code ${code}: ${serverOutput}`));
-    });
-  });
-  return { child, ready };
+function dump() {
+  return JSON.stringify(sockets.map((s) => ({ sent: s.sent, received: s.log })));
 }
 
 before(async () => {
-  const started = startServer();
-  serverProcess = started.child;
-  await started.ready;
+  db = await startTestDb();
+  server = await startServer(db.connectionString);
+  alice = await user('alice');
+  bob = await user('bob');
+  const sA = await track('A', alice.cookie);
+  const sB = await track('B', bob.cookie);
+  const c = await sA.emitAck('conversation_create', { otherUserId: bob.user.userId });
+  assert.equal(c.ok, true);
+  conversation = c.conversation;
+  await sB.next('conversation', (p) => p.conversation?.id === conversation.id);
 });
 
-after(() => {
-  if (serverProcess) serverProcess.kill('SIGTERM');
+after(async () => {
+  try { for (const s of sockets) s.disconnect(); } catch {}
+  try { if (server) await server.stop(); } catch {}
+  try { if (db) await stopTestDb(db); } catch {}
 });
 
-test('full two-person relay: key exchange, messages, statuses, rejections', async () => {
-  const SECRET_A = 'PLAINTEXT_FROM_A_9f3a7c must never travel';
-  const SECRET_B = 'PLAINTEXT_FROM_B_2b8d1e must never travel';
-  const SECRET_OFFLINE = 'PLAINTEXT_WHILE_OFFLINE_55aa must never travel';
+test('full two-person authenticated flow with encryption, queue, acks and rejections', async () => {
+  const sA = sockets[0];
+  const sB = sockets[1];
+  const keyA = await deriveConversationKey(alice.keys.privateKey, bob.user.publicKey, conversation.id);
+  const keyB = await deriveConversationKey(bob.keys.privateKey, alice.user.publicKey, conversation.id);
 
-  const alice = await createPair();
-  const bob = await createPair();
-
-  const A = new TestClient('A');
-  const B = new TestClient('B');
-
-  A.emit('join', { role: 'A', publicKey: alice.publicKeyBase64 });
-  const joinedA = await A.next('joined');
-  assert.equal(joinedA.role, 'A');
-  const peerStatusA0 = await A.next('peer_status');
-  assert.equal(peerStatusA0.connected, false);
-
-  B.emit('join', { role: 'B', publicKey: bob.publicKeyBase64 });
-  const joinedB = await B.next('joined');
-  assert.equal(joinedB.role, 'B');
-
-  const receivedKeyA = await A.next('peer_public_key');
-  const receivedKeyB = await B.next('peer_public_key');
-  assert.equal(receivedKeyA.publicKey, bob.publicKeyBase64);
-  assert.equal(receivedKeyB.publicKey, alice.publicKeyBase64);
-
-  const connectedA = await A.next('peer_status', (p) => p.connected === true);
-  const connectedB = await B.next('peer_status', (p) => p.connected === true);
-  assert.equal(connectedA.peer, 'B');
-  assert.equal(connectedB.peer, 'A');
-
-  B.emit('public_key', { publicKey: bob.publicKeyBase64 });
-  const refreshed = await A.next('peer_public_key', (p) => p.publicKey === bob.publicKeyBase64);
-  assert.equal(refreshed.publicKey, bob.publicKeyBase64);
-
-  const keyA = await deriveSharedKey(alice.privateKey, bob.publicKeyBase64, 'A-B');
-  const keyB = await deriveSharedKey(bob.privateKey, alice.publicKeyBase64, 'A-B');
-
-  const packet1 = await encryptMessage(keyA, SECRET_A, {
-    messageId: crypto.randomUUID(),
-    sender: 'A',
-    timestamp: Date.now()
+  const m1 = crypto.randomUUID();
+  const p1 = await encryptFor(keyA, 'MSG_A', {
+    messageId: m1,
+    senderId: alice.user.userId,
+    aad: `securechat.v1|${conversation.id}|${m1}|${alice.user.userId}`
   });
-  A.emit('encrypted_message', packet1);
+  const ack1 = await sA.emitAck('message_send', { conversationId: conversation.id, ...p1 });
+  assert.equal(ack1.ok, true);
+  assert.equal(ack1.status, 'sent');
+  const d1 = await sB.next('message_deliver', (x) => x.messageId === m1);
+  assert.equal(d1.sender, alice.user.userId);
+  assert.ok(!JSON.stringify(d1).includes('MSG_A'));
+  const ackB1 = await sB.emitAck('message_ack', { messageId: m1 });
+  assert.deepEqual(ackB1, { ok: true, deleted: true });
+  await sA.next('delivery_status', (x) => x.messageId === m1 && x.status === 'delivered');
 
-  const sentAck = await A.next('delivery_status', (p) => p.status === 'sent');
-  assert.equal(sentAck.messageId, packet1.messageId);
-
-  const receivedByB = await B.next('encrypted_message');
-  assert.equal(receivedByB.sender, 'A');
-  assert.equal(receivedByB.messageId, packet1.messageId);
-  assert.ok(!JSON.stringify(receivedByB).includes(SECRET_A));
-  assert.equal(await decryptMessage(keyB, receivedByB), SECRET_A);
-
-  B.emit('delivery_status', { messageId: packet1.messageId, status: 'delivered' });
-  const deliveredAck = await A.next('delivery_status', (p) => p.status === 'delivered');
-  assert.equal(deliveredAck.messageId, packet1.messageId);
-
-  const packet2 = await encryptMessage(keyB, SECRET_B, {
-    messageId: crypto.randomUUID(),
-    sender: 'B',
-    timestamp: Date.now()
+  const m2 = crypto.randomUUID();
+  const p2 = await encryptFor(keyB, 'MSG_B', {
+    messageId: m2,
+    senderId: bob.user.userId,
+    aad: `securechat.v1|${conversation.id}|${m2}|${bob.user.userId}`
   });
-  B.emit('encrypted_message', packet2);
-  const receivedByA = await A.next('encrypted_message');
-  assert.equal(receivedByA.sender, 'B');
-  assert.equal(await decryptMessage(keyA, receivedByA), SECRET_B);
-  assert.notEqual(packet1.iv, packet2.iv);
+  const ack2 = await sB.emitAck('message_send', { conversationId: conversation.id, ...p2 });
+  assert.equal(ack2.ok, true);
+  const d2 = await sA.next('message_deliver', (x) => x.messageId === m2);
+  assert.equal(d2.sender, bob.user.userId);
+  await sA.emitAck('message_ack', { messageId: m2 });
 
-  A.emit('delivery_status', { messageId: packet2.messageId, status: 'delivered' });
-  const deliveredB = await B.next('delivery_status', (p) => p.status === 'delivered');
-  assert.equal(deliveredB.messageId, packet2.messageId);
-
-  const C = new TestClient('C');
-  const carol = await createPair();
-  C.emit('join', { role: 'A', publicKey: carol.publicKeyBase64 });
-  const joinError = await C.next('join_error');
-  assert.equal(joinError.error, 'Person A is already connected.');
-  C.disconnect();
-
-  B.emit('encrypted_message', {
-    ...packet2,
-    messageId: crypto.randomUUID(),
-    sender: 'A',
-    timestamp: Date.now()
+  const m3 = crypto.randomUUID();
+  const p3 = await encryptFor(keyA, 'MSG_OFFLINE', {
+    messageId: m3,
+    senderId: alice.user.userId,
+    aad: `securechat.v1|${conversation.id}|${m3}|${alice.user.userId}`
   });
-  const mismatch = await B.next('message_rejected', (p) => p.reason === 'sender_mismatch');
-  assert.ok(mismatch.messageId);
+  sB.disconnect();
+  const ack3 = await sA.emitAck('message_send', { conversationId: conversation.id, ...p3 });
+  assert.equal(ack3.status, 'queued');
+  const dup = await sA.emitAck('message_send', { conversationId: conversation.id, ...p3 });
+  assert.equal(dup.status, 'duplicate');
 
-  B.emit('encrypted_message', {
+  const sB2 = await track('B2', bob.cookie);
+  const sync = await sB2.emitAck('message_sync', {});
+  const q = sync.messages.find((mm) => mm.messageId === m3);
+  assert.ok(q);
+  await sB2.emitAck('message_ack', { messageId: m3 });
+
+  const bad = await sA.emitAck('message_send', {
+    conversationId: conversation.id,
     messageId: crypto.randomUUID(),
-    sender: 'B',
-    ciphertext: packet2.ciphertext,
+    ciphertext: p1.ciphertext,
     iv: 'AAAA',
     timestamp: Date.now()
   });
-  const badPacket = await B.next('message_rejected', (p) => p.reason === 'invalid_packet');
-  assert.ok(badPacket.messageId);
+  assert.equal(bad.ok, false);
+  assert.equal(bad.reason, 'invalid_packet');
 
-  B.emit('encrypted_message', {
-    messageId: 'x'.repeat(200),
-    sender: 'B',
-    ciphertext: packet2.ciphertext,
-    iv: packet2.iv,
-    timestamp: Date.now()
-  });
-  const badId = await B.next('message_rejected', (p) => p.reason === 'invalid_packet');
-  assert.equal(badId.messageId, '');
+  const forbUser = await user('carolx');
+  const forb = forbUser.cookie;
+  const sC = await track('C', forb);
+  const f = await sC.emitAck('message_send', { conversationId: conversation.id, ...p1 });
+  assert.equal(f.ok, false);
+  assert.equal(f.reason, 'forbidden');
+  sC.disconnect();
+  sB2.disconnect();
 
-  A.emit('delivery_status', { messageId: packet1.messageId, status: 'delivered' });
-  const unknownRoute = await A.next('message_rejected', (p) => p.reason === 'unknown_message');
-  assert.equal(unknownRoute.messageId, packet1.messageId);
+  const t = dump();
+  assert.ok(!t.includes('MSG_A'));
+  assert.ok(!t.includes('MSG_B'));
+  assert.ok(!t.includes('MSG_OFFLINE'));
+  assert.ok(!t.includes('privateKey'));
+  assert.ok(!t.includes('pkcs8'));
 
-  B.disconnect();
-  const offline = await A.next('peer_status', (p) => p.connected === false);
-  assert.equal(offline.peer, 'B');
-
-  const packet3 = await encryptMessage(keyA, SECRET_OFFLINE, {
-    messageId: crypto.randomUUID(),
-    sender: 'A',
-    timestamp: Date.now()
-  });
-  A.emit('encrypted_message', packet3);
-  const offlineReject = await A.next('message_rejected', (p) => p.reason === 'peer_unavailable');
-  assert.equal(offlineReject.messageId, packet3.messageId);
-
-  A.disconnect();
-
-  const allTraffic = JSON.stringify([...sentLog, ...A.log, ...B.log]);
-  assert.ok(!allTraffic.includes('privateKey'));
-  assert.ok(!allTraffic.includes('pkcs8'));
-  assert.ok(!allTraffic.includes(SECRET_A));
-  assert.ok(!allTraffic.includes(SECRET_B));
-  assert.ok(!allTraffic.includes(SECRET_OFFLINE));
-
-  for (const entry of sentLog) {
-    assert.ok(ALLOWED_CLIENT_EVENTS.has(entry.event), `unexpected client event: ${entry.event}`);
+  for (const s of sockets) {
+    for (const e of s.sent) {
+      assert.ok(ALLOWED_CLIENT_EVENTS.has(e.event));
+    }
   }
-
-  assert.ok(serverOutput.includes('listening'));
-  assert.ok(!serverOutput.includes(SECRET_A));
-  assert.ok(!serverOutput.includes(SECRET_B));
-  assert.ok(!serverOutput.includes('privateKey'));
-});
-
-test('invalid identity and invalid public key are rejected on join', async () => {
-  const badRole = new TestClient('bad-role');
-  badRole.emit('join', { role: 'Z', publicKey: 'AAAA' });
-  const roleError = await badRole.next('join_error');
-  assert.match(roleError.error, /Invalid identity/);
-  badRole.disconnect();
-
-  const badKey = new TestClient('bad-key');
-  badKey.emit('join', { role: 'B', publicKey: 'not-a-public-key' });
-  const keyError = await badKey.next('join_error');
-  assert.match(keyError.error, /Invalid public key/);
-  badKey.disconnect();
 });

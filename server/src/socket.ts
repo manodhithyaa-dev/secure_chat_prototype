@@ -1,211 +1,238 @@
 import type { Server, Socket } from 'socket.io';
+import type { Pool } from 'pg';
+import { tokenFromCookies } from './auth/cookies';
+import { validateSession } from './auth/sessions';
+import {
+  buildConversation,
+  deletePendingMessage,
+  findPendingMessages,
+  getConversationPartners,
+  getOrCreateDirectConversation,
+  getOtherMember,
+  insertMessage,
+  isMember,
+  listConversations,
+  findUserById
+} from './db/queries';
+import { presence } from './presence';
 import {
   EVENT,
+  type ConversationAck,
   type DeliveryStatusPayload,
-  type EncryptedPacket,
-  type JoinPayload,
-  type MessageRejectedPayload,
-  type PublicKeyPayload,
-  type Role
+  type MessageAckPayload,
+  type SendAck,
+  type SyncAck
 } from './types';
+import { isUuid, isValidMessageId, validateSendPayload } from './validate';
 
-const peers = new Map<Role, Socket>();
-const publicKeys = new Map<Role, string>();
-const routes = new Map<string, { from: Role; to: Role }>();
+type Ack = (response: unknown) => void;
 
-const BASE64_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
-
-function isRole(value: unknown): value is Role {
-  return value === 'A' || value === 'B';
+function respond(ack: Ack | undefined, payload: unknown): void {
+  if (typeof ack === 'function') ack(payload);
 }
 
-function decodeBase64Strict(value: string): Uint8Array | null {
-  if (
-    typeof value !== 'string' ||
-    value.length === 0 ||
-    value.length % 4 !== 0 ||
-    !BASE64_PATTERN.test(value)
-  ) {
-    return null;
+function emitToUser(io: Server, userId: string, event: string, payload: unknown): boolean {
+  const sockets = presence.socketsFor(userId);
+  for (const socket of sockets) {
+    socket.emit(event, payload);
   }
+  return sockets.length > 0;
+}
+
+async function broadcastPresence(
+  io: Server,
+  pool: Pool,
+  userId: string,
+  online: boolean,
+  forSocket?: Socket
+): Promise<void> {
+  let partners: Array<{ userId: string }>;
   try {
-    return new Uint8Array(Buffer.from(value, 'base64'));
+    partners = await getConversationPartners(pool, userId);
   } catch {
-    return null;
+    return;
+  }
+  for (const partner of partners) {
+    if (forSocket) {
+      forSocket.emit(EVENT.presence, {
+        userId: partner.userId,
+        online: presence.isOnline(partner.userId)
+      });
+      if (partner.userId === userId) continue;
+    }
+    if (partner.userId !== userId || !forSocket) {
+      emitToUser(io, partner.userId, EVENT.presence, { userId, online });
+    }
   }
 }
 
-function isValidPublicKey(value: unknown): value is string {
-  if (typeof value !== 'string' || value.length > 512) return false;
-  const bytes = decodeBase64Strict(value);
-  if (!bytes) return false;
-  return bytes.length >= 50 && bytes.length <= 150;
-}
+export function registerSocketHandlers(io: Server, pool: Pool): void {
+  io.use(async (socket, next) => {
+    try {
+      let token = tokenFromCookies(socket.handshake.headers.cookie);
+      const authPayload = socket.handshake.auth as { token?: unknown } | undefined;
+      if (!token && authPayload && typeof authPayload.token === 'string') {
+        token = authPayload.token;
+      }
+      const session = await validateSession(pool, token);
+      if (!session) {
+        next(new Error('unauthorized'));
+        return;
+      }
+      socket.data.userId = session.userId;
+      socket.data.sessionId = session.sessionId;
+      next();
+    } catch {
+      next(new Error('unauthorized'));
+    }
+  });
 
-function isValidPacket(value: unknown): value is EncryptedPacket {
-  if (!value || typeof value !== 'object') return false;
-  const packet = value as Record<string, unknown>;
-  const iv = decodeBase64Strict(String(packet.iv ?? ''));
-  const ciphertext = decodeBase64Strict(String(packet.ciphertext ?? ''));
-  return (
-    typeof packet.messageId === 'string' &&
-    packet.messageId.length >= 1 &&
-    packet.messageId.length <= 128 &&
-    isRole(packet.sender) &&
-    typeof packet.ciphertext === 'string' &&
-    packet.ciphertext.length <= 32768 &&
-    iv !== null &&
-    iv.length === 12 &&
-    ciphertext !== null &&
-    ciphertext.length >= 17 &&
-    typeof packet.timestamp === 'number' &&
-    Number.isFinite(packet.timestamp)
-  );
-}
-
-function isValidDeliveryStatus(value: unknown): value is DeliveryStatusPayload {
-  if (!value || typeof value !== 'object') return false;
-  const payload = value as Record<string, unknown>;
-  return (
-    typeof payload.messageId === 'string' &&
-    payload.messageId.length >= 1 &&
-    payload.messageId.length <= 128 &&
-    (payload.status === 'sent' || payload.status === 'delivered')
-  );
-}
-
-function peerOf(role: Role): Role {
-  return role === 'A' ? 'B' : 'A';
-}
-
-function reject(socket: Socket, messageId: string, reason: MessageRejectedPayload['reason']): void {
-  socket.emit(EVENT.messageRejected, { messageId, reason } satisfies MessageRejectedPayload);
-}
-
-export function registerSocketHandlers(io: Server): void {
   io.on('connection', (socket: Socket) => {
-    socket.on(EVENT.join, (payload: JoinPayload) => {
-      const role = payload?.role;
-      const publicKey = payload?.publicKey;
+    const userId = socket.data.userId as string;
+    presence.add(userId, socket);
+    void broadcastPresence(io, pool, userId, true, socket);
 
-      if (!isRole(role)) {
-        socket.emit(EVENT.joinError, { error: 'Invalid identity. Choose Person A or Person B.' });
-        return;
-      }
-      if (socket.data.role && socket.data.role !== role) {
-        socket.emit(EVENT.joinError, { error: 'This connection already joined with another identity.' });
-        return;
-      }
-      if (!isValidPublicKey(publicKey)) {
-        socket.emit(EVENT.joinError, { error: 'Invalid public key.' });
-        return;
-      }
-
-      const existing = peers.get(role);
-      if (existing && existing.id !== socket.id && existing.connected) {
-        socket.emit(EVENT.joinError, { error: `Person ${role} is already connected.` });
-        return;
-      }
-
-      peers.set(role, socket);
-      publicKeys.set(role, publicKey);
-      socket.data.role = role;
-      socket.emit(EVENT.joined, { role });
-
-      const other = peerOf(role);
-      const otherSocket = peers.get(other);
-      const otherKey = publicKeys.get(other);
-
-      if (otherSocket && otherSocket.connected && otherKey) {
-        socket.emit(EVENT.peerPublicKey, { publicKey: otherKey });
-        otherSocket.emit(EVENT.peerPublicKey, { publicKey });
-        socket.emit(EVENT.peerStatus, { peer: other, connected: true });
-        otherSocket.emit(EVENT.peerStatus, { peer: role, connected: true });
-      } else {
-        socket.emit(EVENT.peerStatus, { peer: other, connected: false });
+    socket.on('conversation_list', async (_payload: unknown, ack?: Ack) => {
+      try {
+        const conversations = await listConversations(pool, userId, presence.isOnline);
+        respond(ack, { ok: true, conversations } satisfies ConversationAck);
+      } catch {
+        respond(ack, { ok: false, conversations: [], reason: 'server_error' } satisfies ConversationAck);
       }
     });
 
-    socket.on(EVENT.publicKey, (payload: PublicKeyPayload) => {
-      const role = socket.data.role as Role | undefined;
-      if (!role || !isRole(role)) {
-        socket.emit(EVENT.joinError, { error: 'Join before sending a public key.' });
-        return;
-      }
-      if (!isValidPublicKey(payload?.publicKey)) {
-        socket.emit(EVENT.joinError, { error: 'Invalid public key.' });
-        return;
-      }
-      publicKeys.set(role, payload.publicKey);
-      const otherSocket = peers.get(peerOf(role));
-      if (otherSocket && otherSocket.connected) {
-        otherSocket.emit(EVENT.peerPublicKey, { publicKey: payload.publicKey });
+    socket.on('conversation_create', async (payload: unknown, ack?: Ack) => {
+      try {
+        const otherUserId = (payload as { otherUserId?: unknown } | undefined)?.otherUserId;
+        if (!isUuid(otherUserId)) {
+          respond(ack, { ok: false, reason: 'invalid_user' } satisfies ConversationAck);
+          return;
+        }
+        if (otherUserId === userId) {
+          respond(ack, { ok: false, reason: 'invalid_user' } satisfies ConversationAck);
+          return;
+        }
+        const other = await findUserById(pool, otherUserId);
+        if (!other) {
+          respond(ack, { ok: false, reason: 'not_found' } satisfies ConversationAck);
+          return;
+        }
+        const { id } = await getOrCreateDirectConversation(pool, userId, otherUserId);
+        const { rows } = await pool.query(
+          'SELECT id, type, updated_at FROM conversations WHERE id = $1',
+          [id]
+        );
+        const conversation = await buildConversation(pool, rows[0], userId, presence.isOnline);
+        respond(ack, { ok: true, conversation } satisfies ConversationAck);
+
+        const forOther = await buildConversation(pool, rows[0], otherUserId, presence.isOnline);
+        emitToUser(io, otherUserId, EVENT.conversation, { conversation: forOther });
+        if (otherUserId !== userId) {
+          emitToUser(io, userId, EVENT.conversation, { conversation });
+          emitToUser(io, userId, EVENT.presence, {
+            userId: otherUserId,
+            online: presence.isOnline(otherUserId)
+          });
+          emitToUser(io, otherUserId, EVENT.presence, {
+            userId,
+            online: presence.isOnline(userId)
+          });
+        }
+      } catch {
+        respond(ack, { ok: false, reason: 'server_error' } satisfies ConversationAck);
       }
     });
 
-    socket.on(EVENT.encryptedMessage, (packet: EncryptedPacket) => {
-      const role = socket.data.role as Role | undefined;
-      const rawId =
-        packet && typeof packet.messageId === 'string' ? packet.messageId : '';
-      const messageId = rawId.length >= 1 && rawId.length <= 128 ? rawId : '';
+    socket.on('message_send', async (payload: unknown, ack?: Ack) => {
+      let messageId = '';
+      try {
+        const valid = validateSendPayload(payload);
+        if (!valid) {
+          respond(ack, { ok: false, reason: 'invalid_packet' } satisfies SendAck);
+          return;
+        }
+        messageId = valid.messageId;
+        const member = await isMember(pool, valid.conversationId, userId);
+        const other = member ? await getOtherMember(pool, valid.conversationId, userId) : null;
+        if (!member || !other) {
+          respond(ack, { ok: false, messageId, reason: 'forbidden' } satisfies SendAck);
+          return;
+        }
 
-      if (!role || !isRole(role)) {
-        reject(socket, messageId, 'not_joined');
-        return;
-      }
-      if (!isValidPacket(packet)) {
-        reject(socket, messageId, 'invalid_packet');
-        return;
-      }
-      if (packet.sender !== role) {
-        reject(socket, packet.messageId, 'sender_mismatch');
-        return;
-      }
-
-      const other = peerOf(role);
-      const otherSocket = peers.get(other);
-      if (!otherSocket || !otherSocket.connected) {
-        socket.emit(EVENT.peerStatus, { peer: other, connected: false });
-        reject(socket, packet.messageId, 'peer_unavailable');
-        return;
-      }
-
-      routes.set(packet.messageId, { from: role, to: other });
-      otherSocket.emit(EVENT.encryptedMessage, packet);
-      socket.emit(EVENT.deliveryStatus, { messageId: packet.messageId, status: 'sent' });
-    });
-
-    socket.on(EVENT.deliveryStatus, (payload: DeliveryStatusPayload) => {
-      const role = socket.data.role as Role | undefined;
-      if (!role || !isRole(role)) return;
-      if (!isValidDeliveryStatus(payload)) return;
-
-      const route = routes.get(payload.messageId);
-      if (!route || route.to !== role) {
-        reject(socket, payload.messageId, 'unknown_message');
-        return;
-      }
-
-      const fromSocket = peers.get(route.from);
-      if (fromSocket && fromSocket.connected) {
-        fromSocket.emit(EVENT.deliveryStatus, {
-          messageId: payload.messageId,
-          status: payload.status
+        const inserted = await insertMessage(pool, {
+          conversationId: valid.conversationId,
+          senderId: userId,
+          recipientId: other.userId,
+          clientMessageId: valid.messageId,
+          ciphertext: valid.ciphertext,
+          iv: valid.iv
         });
+
+        if (!inserted) {
+          respond(ack, { ok: true, messageId, status: 'duplicate' } satisfies SendAck);
+          return;
+        }
+
+        const deliveredLive = emitToUser(io, other.userId, EVENT.messageDeliver, {
+          conversationId: valid.conversationId,
+          messageId: valid.messageId,
+          sender: userId,
+          ciphertext: valid.ciphertext,
+          iv: valid.iv,
+          timestamp: valid.timestamp
+        });
+
+        respond(
+          ack,
+          { ok: true, messageId, status: deliveredLive ? 'sent' : 'queued' } satisfies SendAck
+        );
+        if (deliveredLive) {
+          socket.emit(EVENT.deliveryStatus, {
+            messageId,
+            status: 'sent'
+          } satisfies DeliveryStatusPayload);
+        }
+      } catch {
+        respond(ack, {
+          ok: false,
+          messageId,
+          reason: 'server_error'
+        } satisfies SendAck);
+      }
+    });
+
+    socket.on('message_ack', async (payload: unknown, ack?: Ack) => {
+      try {
+        const messageId = (payload as { messageId?: unknown } | undefined)?.messageId;
+        if (!isValidMessageId(messageId)) {
+          respond(ack, { ok: false, deleted: false } satisfies MessageAckPayload);
+          return;
+        }
+        const removed = await deletePendingMessage(pool, userId, messageId);
+        if (removed) {
+          emitToUser(io, removed.senderId, EVENT.deliveryStatus, {
+            messageId,
+            status: 'delivered'
+          } satisfies DeliveryStatusPayload);
+        }
+        respond(ack, { ok: true, deleted: Boolean(removed) } satisfies MessageAckPayload);
+      } catch {
+        respond(ack, { ok: false, deleted: false } satisfies MessageAckPayload);
+      }
+    });
+
+    socket.on('message_sync', async (_payload: unknown, ack?: Ack) => {
+      try {
+        const messages = await findPendingMessages(pool, userId);
+        respond(ack, { ok: true, messages } satisfies SyncAck);
+      } catch {
+        respond(ack, { ok: false, messages: [], reason: 'server_error' } satisfies SyncAck);
       }
     });
 
     socket.on('disconnect', () => {
-      const role = socket.data.role as Role | undefined;
-      if (!role || !isRole(role)) return;
-      if (peers.get(role)?.id !== socket.id) return;
-
-      peers.delete(role);
-      const other = peerOf(role);
-      const otherSocket = peers.get(other);
-      if (otherSocket && otherSocket.connected) {
-        otherSocket.emit(EVENT.peerStatus, { peer: role, connected: false });
-      }
+      presence.remove(userId, socket);
+      void broadcastPresence(io, pool, userId, false);
     });
   });
 }

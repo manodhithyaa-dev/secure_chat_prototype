@@ -6,9 +6,28 @@ const ECDH_PARAMS = { name: 'ECDH', namedCurve: 'P-256' };
 const HKDF_SALT_PREFIX = 'secure-chat-v1|salt|';
 const HKDF_INFO_PREFIX = 'secure-chat-v1|key|';
 const DEFAULT_CONVERSATION_ID = 'A-B';
+const AAD_PREFIX = 'securechat.v1|';
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export const MAX_MESSAGE_LENGTH = 4096;
 export const IV_BYTE_LENGTH = 12;
+
+export function isValidParticipantId(value) {
+  return value === 'A' || value === 'B' || (typeof value === 'string' && UUID_PATTERN.test(value));
+}
+
+export function buildAad(conversationId, messageId, senderId) {
+  if (typeof conversationId !== 'string' || conversationId.length < 1 || conversationId.length > 256) {
+    throw new Error('Invalid AAD context');
+  }
+  if (typeof messageId !== 'string' || messageId.length < 1 || messageId.length > 128) {
+    throw new Error('Invalid AAD context');
+  }
+  if (!isValidParticipantId(senderId)) {
+    throw new Error('Invalid AAD context');
+  }
+  return `${AAD_PREFIX}${conversationId}|${messageId}|${senderId}`;
+}
 
 export function bytesToBase64(bytes) {
   let binary = '';
@@ -96,7 +115,7 @@ export function validatePacket(packet) {
   if (typeof messageId !== 'string' || messageId.length < 1 || messageId.length > 128) {
     throw new Error('Invalid encrypted packet');
   }
-  if (sender !== 'A' && sender !== 'B') {
+  if (!isValidParticipantId(sender)) {
     throw new Error('Invalid encrypted packet');
   }
   if (typeof timestamp !== 'number' || !Number.isFinite(timestamp)) {
@@ -113,7 +132,7 @@ export function validatePacket(packet) {
   return { messageId, sender, ciphertext, iv, timestamp, ivBytes, ciphertextBytes };
 }
 
-export async function encryptMessage(conversationKey, plaintext, meta) {
+export async function encryptMessage(conversationKey, plaintext, meta, aad) {
   if (typeof plaintext !== 'string' || plaintext.length < 1) {
     throw new Error('Message must be a non-empty string');
   }
@@ -123,16 +142,23 @@ export async function encryptMessage(conversationKey, plaintext, meta) {
   if (!meta || typeof meta.messageId !== 'string' || !meta.messageId) {
     throw new Error('messageId is required');
   }
-  if (meta.sender !== 'A' && meta.sender !== 'B') {
-    throw new Error('sender must be A or B');
+  if (!isValidParticipantId(meta.sender)) {
+    throw new Error('Invalid sender');
   }
   if (typeof meta.timestamp !== 'number' || !Number.isFinite(meta.timestamp)) {
     throw new Error('timestamp must be a number');
   }
+  if (aad !== undefined && (typeof aad !== 'string' || aad.length < 1)) {
+    throw new Error('Invalid AAD');
+  }
 
   const iv = crypto.getRandomValues(new Uint8Array(IV_BYTE_LENGTH));
+  const params = { name: 'AES-GCM', iv };
+  if (aad !== undefined) {
+    params.additionalData = encoder.encode(aad);
+  }
   const encrypted = new Uint8Array(
-    await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, conversationKey, encoder.encode(plaintext))
+    await crypto.subtle.encrypt(params, conversationKey, encoder.encode(plaintext))
   );
 
   return {
@@ -144,14 +170,17 @@ export async function encryptMessage(conversationKey, plaintext, meta) {
   };
 }
 
-export async function decryptMessage(conversationKey, packet) {
+export async function decryptMessage(conversationKey, packet, aad) {
   const valid = validatePacket(packet);
+  if (aad !== undefined && (typeof aad !== 'string' || aad.length < 1)) {
+    throw new Error('Invalid AAD');
+  }
   try {
-    const decrypted = await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: valid.ivBytes },
-      conversationKey,
-      valid.ciphertextBytes
-    );
+    const params = { name: 'AES-GCM', iv: valid.ivBytes };
+    if (aad !== undefined) {
+      params.additionalData = encoder.encode(aad);
+    }
+    const decrypted = await crypto.subtle.decrypt(params, conversationKey, valid.ciphertextBytes);
     return decoder.decode(decrypted);
   } catch {
     throw new Error('Decryption failed');
